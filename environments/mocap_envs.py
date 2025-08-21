@@ -109,9 +109,9 @@ class EnvBase(gym.Env):
         self.action_space = gym.spaces.Box(-high, high, dtype=np.float32)
 
     def load_data(self, pose_vae_path):
-        mocap_file = os.path.join(current_dir, "pose0.npy")
-        data = torch.from_numpy(np.load(mocap_file))
-        self.mocap_data = data.float().to(self.device)
+        mocap_file = os.path.join(current_dir, "mocap.npz")
+        raw_data = np.load(mocap_file)
+        self.mocap_data = torch.from_numpy(raw_data["X"]).float().to(self.device)
 
         if os.path.isdir(pose_vae_path):
             basepath = os.path.normpath(pose_vae_path)
@@ -119,8 +119,24 @@ class EnvBase(gym.Env):
         else:
             basepath = os.path.dirname(pose_vae_path)
 
+        # Remap external module path to local implementation if needed
+        try:
+            import types
+            from vae_motion import models as local_models
+            import sys as _sys
+            if 'mvae.algorithms.models' not in _sys.modules:
+                _sys.modules['mvae'] = types.ModuleType('mvae')
+                _sys.modules['mvae.algorithms'] = types.ModuleType('mvae.algorithms')
+                _sys.modules['mvae.algorithms.models'] = local_models
+        except Exception:
+            pass
+
         self.pose_vae_model = torch.load(pose_vae_path, map_location=self.device)
         self.pose_vae_model.eval()
+        try:
+            print("Model class:", type(self.pose_vae_model), "module:", self.pose_vae_model.__class__.__module__)
+        except Exception:
+            pass
 
         assert (
             self.pose_vae_model.num_future_predictions >= self.frame_skip

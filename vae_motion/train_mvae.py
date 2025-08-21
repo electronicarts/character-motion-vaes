@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
+from torch.utils.data import DataLoader
 
 from common.logging_utils import CSVLogger
 from common.misc_utils import update_linear_schedule
@@ -21,6 +22,7 @@ from vae_motion.models import (
     PoseMixtureVAE,
     PoseMixtureSpecialistVAE,
 )
+from mvae_dataloader_accad import MVAEACCADDataset
 
 
 class StatsLogger:
@@ -124,7 +126,7 @@ def main():
         num_future_predictions=1,
         num_steps_per_rollout=8,
         kl_beta=1.0,
-        load_saved_model=True,
+        load_saved_model=False,
     )
 
     # learning parameters
@@ -136,52 +138,17 @@ def main():
     args.initial_lr = 1e-4
     args.final_lr = 1e-7
 
-    raw_data = np.load(args.mocap_file)
-    mocap_data = torch.from_numpy(raw_data["data"]).float().to(args.device)
-    end_indices = raw_data["end_indices"]
-
-    max = mocap_data.max(dim=0)[0]
-    min = mocap_data.min(dim=0)[0]
-    avg = mocap_data.mean(dim=0)
-    std = mocap_data.std(dim=0)
-
-    # Make sure we don't divide by 0
-    std[std == 0] = 1.0
-
+    # 데이터셋 로딩 교체
+    ds = MVAEACCADDataset(npz_path=args.mocap_file)
+    dl = DataLoader(ds, batch_size=args.mini_batch_size, shuffle=True, drop_last=True, num_workers=2)
+    frame_size = ds.dim
+    
+    # 정규화 정보 설정
     normalization = {
         "mode": args.norm_mode,
-        "max": max,
-        "min": min,
-        "avg": avg,
-        "std": std,
+        "avg": torch.from_numpy(ds.mean).float().to(args.device),
+        "std": torch.from_numpy(ds.std).float().to(args.device),
     }
-
-    if args.norm_mode == "minmax":
-        mocap_data = 2 * (mocap_data - min) / (max - min) - 1
-
-    elif args.norm_mode == "zscore":
-        mocap_data = (mocap_data - avg) / std
-
-    batch_size = mocap_data.size()[0]
-    frame_size = mocap_data.size()[1]
-
-    # bad indices are ones that has no required next frames
-    # need to take account of num_steps_per_rollout and num_future_predictions
-    bad_indices = np.sort(
-        np.concatenate(
-            [
-                end_indices - i
-                for i in range(
-                    args.num_steps_per_rollout
-                    + (args.num_condition_frames - 1)
-                    + (args.num_future_predictions - 1)
-                )
-            ]
-        )
-    )
-    all_indices = np.arange(batch_size)
-    good_masks = np.isin(all_indices, bad_indices, assume_unique=True, invert=True)
-    selectable_indices = all_indices[good_masks]
 
     pose_vae = PoseMixtureVAE(
         frame_size,
@@ -236,19 +203,12 @@ def main():
         .div_(args.num_future_predictions)
     )
 
-    # buffer for later
-    shape = (args.mini_batch_size, args.num_condition_frames, frame_size)
-    history = torch.empty(shape).to(args.device)
+    # DataLoader를 사용하므로 history buffer는 필요 없음
 
     log_path = os.path.join(current_dir, "log_posevae_progress")
     logger = StatsLogger(args, csv_path=log_path)
 
     for ep in range(1, args.num_epochs + 1):
-        sampler = BatchSampler(
-            SubsetRandomSampler(selectable_indices),
-            args.mini_batch_size,
-            drop_last=True,
-        )
         ep_recon_loss = 0
         ep_kl_loss = 0
         ep_perplexity = 0
@@ -257,55 +217,50 @@ def main():
             vae_optimizer, ep - 1, args.num_epochs, args.initial_lr, args.final_lr
         )
 
-        num_mini_batch = 1
-        for num_mini_batch, indices in enumerate(sampler):
-            t_indices = torch.LongTensor(indices)
-
-            # condition is from newest...oldest, i.e. (t-1, t-2, ... t-n)
-            condition_range = (
-                t_indices.repeat((args.num_condition_frames, 1)).t()
-                + torch.arange(args.num_condition_frames - 1, -1, -1).long()
-            )
-
-            t_indices += args.num_condition_frames
-            history[:, : args.num_condition_frames].copy_(mocap_data[condition_range])
-
-            for offset in range(args.num_steps_per_rollout):
-                # dims: (num_parallel, num_window, feature_size)
-                use_student = torch.rand(1) < sample_schedule[ep - 1]
-
-                prediction_range = (
-                    t_indices.repeat((args.num_future_predictions, 1)).t()
-                    + torch.arange(offset, offset + args.num_future_predictions).long()
+        num_mini_batch = 0
+        for batch_idx, (prev_frames, curr_frames) in enumerate(dl):
+            num_mini_batch += 1
+            
+            # 데이터를 GPU로 이동
+            prev_frames = prev_frames.to(args.device)
+            curr_frames = curr_frames.to(args.device)
+            
+            # 배치 크기 조정
+            batch_size = prev_frames.size(0)
+            if batch_size != args.mini_batch_size:
+                continue
+                
+            # condition과 ground_truth 설정
+            condition = prev_frames.unsqueeze(1)  # (batch_size, 1, frame_size)
+            ground_truth = curr_frames.unsqueeze(1)  # (batch_size, 1, frame_size)
+            
+            # VAE forward pass
+            if isinstance(pose_vae, PoseVQVAE):
+                (vae_output, perplexity), (recon_loss, kl_loss) = feed_vae(
+                    pose_vae, ground_truth, condition, future_weights
                 )
-                ground_truth = mocap_data[prediction_range]
-                condition = history[:, : args.num_condition_frames]
+                ep_perplexity += float(perplexity)
+            else:
+                # PoseVAE, PoseMixtureVAE, PoseMixtureSpecialistVAE
+                (vae_output, _, _), (recon_loss, kl_loss) = feed_vae(
+                    pose_vae, ground_truth, condition, future_weights
+                )
 
-                if isinstance(pose_vae, PoseVQVAE):
-                    (vae_output, perplexity), (recon_loss, kl_loss) = feed_vae(
-                        pose_vae, ground_truth, condition, future_weights
-                    )
-                    ep_perplexity += float(perplexity) / args.num_steps_per_rollout
-                else:
-                    # PoseVAE, PoseMixtureVAE, PoseMixtureSpecialistVAE
-                    (vae_output, _, _), (recon_loss, kl_loss) = feed_vae(
-                        pose_vae, ground_truth, condition, future_weights
-                    )
+            vae_optimizer.zero_grad()
+            (recon_loss + args.kl_beta * kl_loss).backward()
+            vae_optimizer.step()
 
-                history = history.roll(1, dims=1)
-                next_frame = vae_output[:, 0] if use_student else ground_truth[:, 0]
-                history[:, 0].copy_(next_frame.detach())
+            ep_recon_loss += float(recon_loss)
+            ep_kl_loss += float(kl_loss)
 
-                vae_optimizer.zero_grad()
-                (recon_loss + args.kl_beta * kl_loss).backward()
-                vae_optimizer.step()
-
-                ep_recon_loss += float(recon_loss) / args.num_steps_per_rollout
-                ep_kl_loss += float(kl_loss) / args.num_steps_per_rollout
-
-        avg_ep_recon_loss = ep_recon_loss / num_mini_batch
-        avg_ep_kl_loss = ep_kl_loss / num_mini_batch
-        avg_ep_perplexity = ep_perplexity / num_mini_batch
+        if num_mini_batch > 0:
+            avg_ep_recon_loss = ep_recon_loss / num_mini_batch
+            avg_ep_kl_loss = ep_kl_loss / num_mini_batch
+            avg_ep_perplexity = ep_perplexity / num_mini_batch
+        else:
+            avg_ep_recon_loss = 0
+            avg_ep_kl_loss = 0
+            avg_ep_perplexity = 0
 
         logger.log_stats(
             {
