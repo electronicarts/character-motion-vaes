@@ -9,33 +9,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common.controller import init, DiagGaussian
+from common.model_io import (
+    CheckpointFormatError,
+    load_tensors_with_config,
+    read_config_from_file,
+    save_tensors_with_config,
+)
 
 
-class AutoEncoder(nn.Module):
-    def __init__(self, frame_size, latent_size, normalization):
-        super().__init__()
-        self.frame_size = frame_size
-        self.latent_size = latent_size
+class NormalizationMixin:
+    """Shared normalization state for the VAE models.
 
+    The statistics are registered as buffers so they appear in state_dict and
+    follow .to(device). They used to be plain attributes, which meant a
+    state_dict-based save silently dropped them.
+    """
+
+    STAT_KEYS = ("max", "min", "avg", "std")
+
+    def _init_normalization(self, normalization):
         self.mode = normalization.get("mode")
-        self.data_max = normalization.get("max")
-        self.data_min = normalization.get("min")
-        self.data_avg = normalization.get("avg")
-        self.data_std = normalization.get("std")
+        for key in self.STAT_KEYS:
+            value = normalization.get(key)
+            if value is not None:
+                value = torch.as_tensor(value).float()
+            self.register_buffer("data_" + key, value)
 
-        h1 = 256
-        h2 = 128
-        # Encoder
-        # Takes pose | condition (n * poses) as input
-        self.fc1 = nn.Linear(frame_size, h1)
-        self.fc2 = nn.Linear(h1, h2)
-        self.fc3 = nn.Linear(h2, latent_size)
-
-        # Decoder
-        # Takes latent | condition as input
-        self.fc4 = nn.Linear(latent_size, h2)
-        self.fc5 = nn.Linear(h2, h1)
-        self.fc6 = nn.Linear(h1, frame_size)
+    @staticmethod
+    def normalization_from_tensors(config, tensors):
+        """Rebuild the `normalization` constructor argument from a checkpoint."""
+        normalization = {"mode": config["normalization_mode"]}
+        for key in NormalizationMixin.STAT_KEYS:
+            name = "data_" + key
+            if name in tensors:
+                normalization[key] = tensors[name]
+        return normalization
 
     def normalize(self, t):
         if self.mode == "minmax":
@@ -56,6 +64,45 @@ class AutoEncoder(nn.Module):
             return t
         else:
             raise ValueError("Unknown normalization mode")
+
+
+class AutoEncoder(NormalizationMixin, nn.Module):
+    def __init__(self, frame_size, latent_size, normalization):
+        super().__init__()
+        self.frame_size = frame_size
+        self.latent_size = latent_size
+
+        self._init_normalization(normalization)
+
+        h1 = 256
+        h2 = 128
+        # Encoder
+        # Takes pose | condition (n * poses) as input
+        self.fc1 = nn.Linear(frame_size, h1)
+        self.fc2 = nn.Linear(h1, h2)
+        self.fc3 = nn.Linear(h2, latent_size)
+
+        # Decoder
+        # Takes latent | condition as input
+        self.fc4 = nn.Linear(latent_size, h2)
+        self.fc5 = nn.Linear(h2, h1)
+        self.fc6 = nn.Linear(h1, frame_size)
+
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "normalization_mode": self.mode,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            cls.normalization_from_tensors(config, tensors),
+        )
 
     def forward(self, x):
         latent = self.encode(x)
@@ -202,7 +249,7 @@ class MixedDecoder(nn.Module):
         return layer_out
 
 
-class PoseMixtureVAE(nn.Module):
+class PoseMixtureVAE(NormalizationMixin, nn.Module):
     def __init__(
         self,
         frame_size,
@@ -218,11 +265,7 @@ class PoseMixtureVAE(nn.Module):
         self.num_condition_frames = num_condition_frames
         self.num_future_predictions = num_future_predictions
 
-        self.mode = normalization.get("mode")
-        self.data_max = normalization.get("max")
-        self.data_min = normalization.get("min")
-        self.data_avg = normalization.get("avg")
-        self.data_std = normalization.get("std")
+        self._init_normalization(normalization)
 
         hidden_size = 256
         args = (
@@ -236,25 +279,29 @@ class PoseMixtureVAE(nn.Module):
         self.encoder = Encoder(*args)
         self.decoder = MixedDecoder(*args, num_experts)
 
-    def normalize(self, t):
-        if self.mode == "minmax":
-            return 2 * (t - self.data_min) / (self.data_max - self.data_min) - 1
-        elif self.mode == "zscore":
-            return (t - self.data_avg) / self.data_std
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            # num_experts is not kept as an attribute; the first expert weight
+            # has shape (num_experts, input_size, hidden_size).
+            "num_experts": int(self.decoder.w0.shape[0]),
+            "normalization_mode": self.mode,
+        }
 
-    def denormalize(self, t):
-        if self.mode == "minmax":
-            return (t + 1) * (self.data_max - self.data_min) / 2 + self.data_min
-        elif self.mode == "zscore":
-            return t * self.data_std + self.data_avg
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+            config["num_experts"],
+        )
 
     def encode(self, x, c):
         _, mu, logvar = self.encoder(x, c)
@@ -268,7 +315,7 @@ class PoseMixtureVAE(nn.Module):
         return self.decoder(z, c)
 
 
-class PoseMixtureSpecialistVAE(nn.Module):
+class PoseMixtureSpecialistVAE(NormalizationMixin, nn.Module):
     def __init__(
         self,
         frame_size,
@@ -284,11 +331,7 @@ class PoseMixtureSpecialistVAE(nn.Module):
         self.num_condition_frames = num_condition_frames
         self.num_future_predictions = num_future_predictions
 
-        self.mode = normalization.get("mode")
-        self.data_max = normalization.get("max")
-        self.data_min = normalization.get("min")
-        self.data_avg = normalization.get("avg")
-        self.data_std = normalization.get("std")
+        self._init_normalization(normalization)
 
         hidden_size = 128
         args = (
@@ -314,25 +357,27 @@ class PoseMixtureSpecialistVAE(nn.Module):
         self.g_fc2 = nn.Linear(latent_size + gate_hsize, gate_hsize)
         self.g_fc3 = nn.Linear(latent_size + gate_hsize, num_experts)
 
-    def normalize(self, t):
-        if self.mode == "minmax":
-            return 2 * (t - self.data_min) / (self.data_max - self.data_min) - 1
-        elif self.mode == "zscore":
-            return (t - self.data_avg) / self.data_std
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            "num_experts": len(self.decoders),
+            "normalization_mode": self.mode,
+        }
 
-    def denormalize(self, t):
-        if self.mode == "minmax":
-            return (t + 1) * (self.data_max - self.data_min) / 2 + self.data_min
-        elif self.mode == "zscore":
-            return t * self.data_std + self.data_avg
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+            config["num_experts"],
+        )
 
     def gate(self, z, c):
         h1 = F.elu(self.g_fc1(torch.cat((z, c), dim=1)))
@@ -358,7 +403,7 @@ class PoseMixtureSpecialistVAE(nn.Module):
         return predictions[torch.arange(predictions.size(0)), indices]
 
 
-class PoseVAE(nn.Module):
+class PoseVAE(NormalizationMixin, nn.Module):
     def __init__(
         self,
         frame_size,
@@ -373,11 +418,7 @@ class PoseVAE(nn.Module):
         self.num_condition_frames = num_condition_frames
         self.num_future_predictions = num_future_predictions
 
-        self.mode = normalization.get("mode")
-        self.data_max = normalization.get("max")
-        self.data_min = normalization.get("min")
-        self.data_avg = normalization.get("avg")
-        self.data_std = normalization.get("std")
+        self._init_normalization(normalization)
 
         h1 = 256
         # Encoder
@@ -397,25 +438,25 @@ class PoseVAE(nn.Module):
         # self.fc6 = nn.Linear(latent_size + h1, h1)
         self.out = nn.Linear(latent_size + h1, num_future_predictions * frame_size)
 
-    def normalize(self, t):
-        if self.mode == "minmax":
-            return 2 * (t - self.data_min) / (self.data_max - self.data_min) - 1
-        elif self.mode == "zscore":
-            return (t - self.data_avg) / self.data_std
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            "normalization_mode": self.mode,
+        }
 
-    def denormalize(self, t):
-        if self.mode == "minmax":
-            return (t + 1) * (self.data_max - self.data_min) / 2 + self.data_min
-        elif self.mode == "zscore":
-            return t * self.data_std + self.data_avg
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+        )
 
     def forward(self, x, c):
         mu, logvar = self.encode(x, c)
@@ -502,7 +543,7 @@ class VectorQuantizer(nn.Module):
         return quantize, loss, perplexity, embed_ind
 
 
-class PoseVQVAE(nn.Module):
+class PoseVQVAE(NormalizationMixin, nn.Module):
     def __init__(
         self,
         frame_size,
@@ -518,11 +559,7 @@ class PoseVQVAE(nn.Module):
         self.num_condition_frames = num_condition_frames
         self.num_future_predictions = num_future_predictions
 
-        self.mode = normalization.get("mode")
-        self.data_max = normalization.get("max")
-        self.data_min = normalization.get("min")
-        self.data_avg = normalization.get("avg")
-        self.data_std = normalization.get("std")
+        self._init_normalization(normalization)
 
         h1 = 512
         # Encoder
@@ -543,25 +580,27 @@ class PoseVQVAE(nn.Module):
 
         self.quantizer = VectorQuantizer(num_embeddings, latent_size)
 
-    def normalize(self, t):
-        if self.mode == "minmax":
-            return 2 * (t - self.data_min) / (self.data_max - self.data_min) - 1
-        elif self.mode == "zscore":
-            return (t - self.data_avg) / self.data_std
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_embeddings": self.quantizer.num_embeddings,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            "normalization_mode": self.mode,
+        }
 
-    def denormalize(self, t):
-        if self.mode == "minmax":
-            return (t + 1) * (self.data_max - self.data_min) / 2 + self.data_min
-        elif self.mode == "zscore":
-            return t * self.data_std + self.data_avg
-        elif self.mode == "none":
-            return t
-        else:
-            raise ValueError("Unknown normalization mode")
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_embeddings"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+        )
 
     def forward(self, x, c):
         mu = self.encode(x, c)
@@ -598,11 +637,11 @@ class PoseVQVAE(nn.Module):
 
 
 class PoseVAEController(nn.Module):
-    def __init__(self, env):
+    def __init__(self, observation_dim, action_dim):
         super().__init__()
 
-        self.observation_dim = env.observation_space.shape[0]
-        self.action_dim = env.action_space.shape[0]
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
 
         init_r_ = lambda m: init(
             m,
@@ -634,6 +673,17 @@ class PoseVAEController(nn.Module):
             init_t_(nn.Linear(h_size, self.action_dim)),
             nn.Tanh(),
         )
+
+    @property
+    def config(self):
+        return {
+            "observation_dim": self.observation_dim,
+            "action_dim": self.action_dim,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(config["observation_dim"], config["action_dim"])
 
     def forward(self, x):
         return self.actor(x)
@@ -670,6 +720,17 @@ class PoseVAEPolicy(nn.Module):
         )
         self.state_size = 1
 
+    @property
+    def config(self):
+        return {
+            "observation_dim": self.actor.observation_dim,
+            "action_dim": self.actor.action_dim,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(PoseVAEController(config["observation_dim"], config["action_dim"]))
+
     def forward(self, inputs):
         raise NotImplementedError
 
@@ -701,3 +762,46 @@ class PoseVAEPolicy(nn.Module):
         dist_entropy = dist.entropy().mean()
 
         return value, action_log_probs, dist_entropy
+
+
+MODEL_REGISTRY = {
+    "AutoEncoder": AutoEncoder,
+    "PoseVAE": PoseVAE,
+    "PoseMixtureVAE": PoseMixtureVAE,
+    "PoseMixtureSpecialistVAE": PoseMixtureSpecialistVAE,
+    "PoseVQVAE": PoseVQVAE,
+    "PoseVAEController": PoseVAEController,
+    "PoseVAEPolicy": PoseVAEPolicy,
+}
+
+
+def save_model(model, path, extra_config=None):
+    """Write `model` to `path` as a safetensors checkpoint."""
+    config = dict(model.config)
+    config["class"] = type(model).__name__
+    if extra_config:
+        config.update(extra_config)
+    save_tensors_with_config(model.state_dict(), config, path)
+
+
+def load_model(path, device="cpu"):
+    """Rebuild the model described by the checkpoint at `path`."""
+    tensors, config = load_tensors_with_config(path, device)
+    class_name = config.get("class")
+    model_class = MODEL_REGISTRY.get(class_name)
+    if model_class is None:
+        raise CheckpointFormatError(
+            "{} declares unknown model class {!r}; known classes are {}".format(
+                path, class_name, sorted(MODEL_REGISTRY)
+            )
+        )
+    # Building from config first means the normalization buffers already exist
+    # at the right shape, so the strict load below is a no-op for them.
+    model = model_class.from_config(config, tensors)
+    model.load_state_dict(tensors, strict=True)
+    return model.to(device)
+
+
+def read_config(path):
+    """Return a checkpoint's config without reading its tensors."""
+    return read_config_from_file(path)

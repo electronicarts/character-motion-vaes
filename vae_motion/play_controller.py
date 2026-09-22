@@ -10,12 +10,12 @@ import gym
 import numpy as np
 import torch
 
+import environments  # noqa: F401  (registers the env ids)
 from common.misc_utils import EpisodeRunner, POSE_CSV_HEADER
+from vae_motion.models import load_model, read_config
 
 FOOT2METER = 0.3048
 FOOT2CM = FOOT2METER * 100
-
-env_module = "environments"
 
 
 def get_model_paths(args):
@@ -27,8 +27,8 @@ def get_model_paths(args):
         from glob import glob
 
         base_dir = os.path.join(pwd, args.dir)
-        candidate_controller_paths = glob(base_dir + "/con*.pt")
-        candidate_pose_vae_paths = glob(base_dir + "/posevae*.pt")
+        candidate_controller_paths = glob(base_dir + "/con*.safetensors")
+        candidate_pose_vae_paths = glob(base_dir + "/posevae*.safetensors")
 
         if len(candidate_controller_paths) == 0 or len(candidate_pose_vae_paths) == 0:
             print("Controller or VAE file not found in ", base_dir)
@@ -55,15 +55,12 @@ def visualize_rl_controller_replay(args):
 
     controller_path, pose_vae_path = get_model_paths(args)
 
-    actor_critic = torch.load(controller_path, map_location=device)
-    if hasattr(actor_critic, "env_info"):
-        frame_skip = actor_critic.env_info["frame_skip"]
-    else:
-        frame_skip = 1
+    actor_critic = load_model(controller_path, device)
+    frame_skip = read_config(controller_path).get("frame_skip", 1)
     controller = actor_critic.actor
 
     env = gym.make(
-        "{}:{}".format(env_module, args.env),
+        args.env,
         num_parallel=args.num,
         device=device,
         pose_vae_path=pose_vae_path,

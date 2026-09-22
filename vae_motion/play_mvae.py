@@ -9,12 +9,11 @@ os.sys.path.append(parent_dir)
 import gym
 import torch
 
+import environments  # noqa: F401  (registers the env ids)
 from common.misc_utils import EpisodeRunner
 
 FOOT2METER = 0.3048
 FOOT2CM = FOOT2METER * 100
-
-env_module = "environments"
 
 
 def test_vae_replay_full_motion(args):
@@ -25,7 +24,7 @@ def test_vae_replay_full_motion(args):
 
     is_rendered = True
     env = gym.make(
-        "{}:{}".format(env_module, args.env),
+        args.env,
         num_parallel=num_characters,
         device=device,
         pose_vae_path=pose_vae_path,

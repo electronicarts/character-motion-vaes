@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from common.misc_utils import line_to_point_distance
+from vae_motion.models import load_model
 from environments.mocap_renderer import extract_joints_xyz
 
 
@@ -115,11 +116,11 @@ class EnvBase(gym.Env):
 
         if os.path.isdir(pose_vae_path):
             basepath = os.path.normpath(pose_vae_path)
-            pose_vae_path = glob.glob(os.path.join(basepath, "posevae*.pt"))[0]
+            pose_vae_path = glob.glob(os.path.join(basepath, "posevae*.safetensors"))[0]
         else:
             basepath = os.path.dirname(pose_vae_path)
 
-        self.pose_vae_model = torch.load(pose_vae_path, map_location=self.device)
+        self.pose_vae_model = load_model(pose_vae_path, self.device)
         self.pose_vae_model.eval()
 
         assert (
@@ -993,8 +994,10 @@ class HumanMazeEnv(EnvBase):
         )
 
         basepath = os.path.normpath if os.path.isdir(pose_vae_path) else os.path.dirname
-        policy_path = os.path.join(basepath(pose_vae_path), "con_TargetEnv-v0.pt")
-        self.target_controller = torch.load(policy_path, map_location=self.device).actor
+        policy_path = os.path.join(
+            basepath(pose_vae_path), "con_TargetEnv-v0.safetensors"
+        )
+        self.target_controller = load_model(policy_path, self.device).actor
 
         self.action_dim = 2
         high = np.inf * np.ones([self.action_dim])
