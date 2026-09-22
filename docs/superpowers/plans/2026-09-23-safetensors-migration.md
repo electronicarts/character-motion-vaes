@@ -1485,6 +1485,12 @@ Both formats coexist after this task so the tree stays functional. Task 8 remove
 
 This is the only file in the repo permitted to unpickle, and it is deleted in Task 9. Unpickling an `nn.Module` restores `__dict__` directly without calling `__init__`, so Task 6's signature change does not prevent reading the old files.
 
+**Correction to this task, found during execution.** Because unpickling bypasses `__init__`, it also bypasses `_init_normalization`. Verified against the committed VAE after Task 4: `data_max in __dict__: True`, `data_max in _buffers: False`, `data_max in state_dict: False`. So calling `save_model` directly on an unpickled object would silently drop all four normalization statistics — the exact bug this whole design exists to prevent, reintroduced inside the converter.
+
+`--verify`'s `state_dict` comparison would *not* catch it, because both sides would be equally missing the statistics, and `sample()` never calls `normalize()`, so the forward-output check misses it too.
+
+The converter therefore promotes the plain attributes into real buffers before saving, and `--verify` asserts explicitly that the statistics reached the file.
+
 Expected values, already measured from the committed files:
 
 | file | class | config |
