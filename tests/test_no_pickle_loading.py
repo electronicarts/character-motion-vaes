@@ -3,9 +3,9 @@ import re
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# tools/convert_checkpoints.py must unpickle by definition; it is deleted
-# once the committed checkpoints are converted.
-ALLOWED = {os.path.join("tools", "convert_checkpoints.py")}
+# No file may unpickle a checkpoint. The converter used for the one-time
+# migration lives in git history only; see README for how to retrieve it.
+ALLOWED = set()
 
 
 def python_sources():
