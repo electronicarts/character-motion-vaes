@@ -1,5 +1,12 @@
-gym
-imageio
-matplotlib
-pybullet
-torch
+# Pinned to the newest versions verified to work with this codebase.
+# gym must stay at 0.23.1: it is the last release providing both
+# registry.env_specs (removed in 0.24) and the deprecated rng.randint
+# shim used by environments/mocap_envs.py. Versions <= 0.21 cannot be
+# installed at all (invalid opencv-python metadata).
+gym==0.23.1
+imageio==2.37.4
+matplotlib==3.10.9
+numpy==1.26.4
+pybullet==3.2.7
+safetensors==0.8.0
+torch==2.14.0

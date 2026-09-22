@@ -10,12 +10,11 @@ import gym
 import numpy as np
 import torch
 
+import environments  # noqa: F401  (registers the env ids)
 from common.misc_utils import EpisodeRunner, POSE_CSV_HEADER
 
 FOOT2METER = 0.3048
 FOOT2CM = FOOT2METER * 100
-
-env_module = "environments"
 
 
 def get_model_paths(args):
@@ -63,7 +62,7 @@ def visualize_rl_controller_replay(args):
     controller = actor_critic.actor
 
     env = gym.make(
-        "{}:{}".format(env_module, args.env),
+        args.env,
         num_parallel=args.num,
         device=device,
         pose_vae_path=pose_vae_path,

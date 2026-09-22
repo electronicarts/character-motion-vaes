@@ -10,6 +10,7 @@ os.sys.path.append(parent_dir)
 import gym
 import torch
 
+import environments  # noqa: F401  (registers the env ids)
 from algorithms.ppo import PPO
 from algorithms.storage import RolloutStorage
 from common.logging_utils import CSVLogger
@@ -22,7 +23,7 @@ def make_gym_environment(args):
     pose_vae_path = os.path.join(current_dir, args.vae_path)
 
     env = gym.make(
-        "{}:{}".format(args.env_module, args.env_name),
+        args.env_name,
         num_parallel=args.num_parallel,
         device=args.device,
         pose_vae_path=pose_vae_path,
@@ -82,7 +83,6 @@ class StatsLogger:
 def main():
     # setup parameters
     args = SimpleNamespace(
-        env_module="environments",
         env_name="TargetEnv-v0",
         device="cuda:0" if torch.cuda.is_available() else "cpu",
         num_parallel=100,
