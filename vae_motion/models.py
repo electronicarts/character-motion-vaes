@@ -9,6 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from common.controller import init, DiagGaussian
+from common.model_io import (
+    CheckpointFormatError,
+    load_tensors_with_config,
+    read_config_from_file,
+    save_tensors_with_config,
+)
 
 
 class NormalizationMixin:
@@ -81,6 +87,22 @@ class AutoEncoder(NormalizationMixin, nn.Module):
         self.fc4 = nn.Linear(latent_size, h2)
         self.fc5 = nn.Linear(h2, h1)
         self.fc6 = nn.Linear(h1, frame_size)
+
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "normalization_mode": self.mode,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            cls.normalization_from_tensors(config, tensors),
+        )
 
     def forward(self, x):
         latent = self.encode(x)
@@ -257,6 +279,30 @@ class PoseMixtureVAE(NormalizationMixin, nn.Module):
         self.encoder = Encoder(*args)
         self.decoder = MixedDecoder(*args, num_experts)
 
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            # num_experts is not kept as an attribute; the first expert weight
+            # has shape (num_experts, input_size, hidden_size).
+            "num_experts": int(self.decoder.w0.shape[0]),
+            "normalization_mode": self.mode,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+            config["num_experts"],
+        )
+
     def encode(self, x, c):
         _, mu, logvar = self.encoder(x, c)
         return mu, logvar
@@ -310,6 +356,28 @@ class PoseMixtureSpecialistVAE(NormalizationMixin, nn.Module):
         self.g_fc1 = nn.Linear(input_size, gate_hsize)
         self.g_fc2 = nn.Linear(latent_size + gate_hsize, gate_hsize)
         self.g_fc3 = nn.Linear(latent_size + gate_hsize, num_experts)
+
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            "num_experts": len(self.decoders),
+            "normalization_mode": self.mode,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+            config["num_experts"],
+        )
 
     def gate(self, z, c):
         h1 = F.elu(self.g_fc1(torch.cat((z, c), dim=1)))
@@ -369,6 +437,26 @@ class PoseVAE(NormalizationMixin, nn.Module):
         self.fc5 = nn.Linear(latent_size + h1, h1)
         # self.fc6 = nn.Linear(latent_size + h1, h1)
         self.out = nn.Linear(latent_size + h1, num_future_predictions * frame_size)
+
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            "normalization_mode": self.mode,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+        )
 
     def forward(self, x, c):
         mu, logvar = self.encode(x, c)
@@ -491,6 +579,28 @@ class PoseVQVAE(NormalizationMixin, nn.Module):
         self.out = nn.Linear(h1, num_future_predictions * frame_size)
 
         self.quantizer = VectorQuantizer(num_embeddings, latent_size)
+
+    @property
+    def config(self):
+        return {
+            "frame_size": self.frame_size,
+            "latent_size": self.latent_size,
+            "num_embeddings": self.quantizer.num_embeddings,
+            "num_condition_frames": self.num_condition_frames,
+            "num_future_predictions": self.num_future_predictions,
+            "normalization_mode": self.mode,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(
+            config["frame_size"],
+            config["latent_size"],
+            config["num_embeddings"],
+            config["num_condition_frames"],
+            config["num_future_predictions"],
+            cls.normalization_from_tensors(config, tensors),
+        )
 
     def forward(self, x, c):
         mu = self.encode(x, c)
@@ -630,3 +740,44 @@ class PoseVAEPolicy(nn.Module):
         dist_entropy = dist.entropy().mean()
 
         return value, action_log_probs, dist_entropy
+
+
+MODEL_REGISTRY = {
+    "AutoEncoder": AutoEncoder,
+    "PoseVAE": PoseVAE,
+    "PoseMixtureVAE": PoseMixtureVAE,
+    "PoseMixtureSpecialistVAE": PoseMixtureSpecialistVAE,
+    "PoseVQVAE": PoseVQVAE,
+}
+
+
+def save_model(model, path, extra_config=None):
+    """Write `model` to `path` as a safetensors checkpoint."""
+    config = dict(model.config)
+    config["class"] = type(model).__name__
+    if extra_config:
+        config.update(extra_config)
+    save_tensors_with_config(model.state_dict(), config, path)
+
+
+def load_model(path, device="cpu"):
+    """Rebuild the model described by the checkpoint at `path`."""
+    tensors, config = load_tensors_with_config(path, device)
+    class_name = config.get("class")
+    model_class = MODEL_REGISTRY.get(class_name)
+    if model_class is None:
+        raise CheckpointFormatError(
+            "{} declares unknown model class {!r}; known classes are {}".format(
+                path, class_name, sorted(MODEL_REGISTRY)
+            )
+        )
+    # Building from config first means the normalization buffers already exist
+    # at the right shape, so the strict load below is a no-op for them.
+    model = model_class.from_config(config, tensors)
+    model.load_state_dict(tensors, strict=True)
+    return model.to(device)
+
+
+def read_config(path):
+    """Return a checkpoint's config without reading its tensors."""
+    return read_config_from_file(path)
