@@ -1,4 +1,3 @@
-import copy
 import os
 import time
 from types import SimpleNamespace
@@ -20,6 +19,8 @@ from vae_motion.models import (
     PoseVQVAE,
     PoseMixtureVAE,
     PoseMixtureSpecialistVAE,
+    load_model,
+    save_model,
 )
 
 
@@ -193,24 +194,24 @@ def main():
     ).to(args.device)
 
     if isinstance(pose_vae, PoseVAE):
-        pose_vae_path = "posevae_c{}_l{}.pt".format(
+        pose_vae_path = "posevae_c{}_l{}.safetensors".format(
             args.num_condition_frames, args.latent_size
         )
     elif isinstance(pose_vae, PoseMixtureVAE):
-        pose_vae_path = "posevae_c{}_e{}_l{}.pt".format(
+        pose_vae_path = "posevae_c{}_e{}_l{}.safetensors".format(
             args.num_condition_frames, args.num_experts, args.latent_size
         )
     elif isinstance(pose_vae, PoseMixtureSpecialistVAE):
-        pose_vae_path = "posevae_c{}_s{}_l{}.pt".format(
+        pose_vae_path = "posevae_c{}_s{}_l{}.safetensors".format(
             args.num_condition_frames, args.num_experts, args.latent_size
         )
     elif isinstance(pose_vae, PoseVQVAE):
-        pose_vae_path = "posevae_c{}_n{}_l{}.pt".format(
+        pose_vae_path = "posevae_c{}_n{}_l{}.safetensors".format(
             args.num_condition_frames, args.num_embeddings, args.latent_size
         )
 
     if args.load_saved_model:
-        pose_vae = torch.load(pose_vae_path, map_location=args.device)
+        pose_vae = load_model(pose_vae_path, args.device)
     pose_vae.train()
 
     vae_optimizer = optim.Adam(pose_vae.parameters(), lr=args.initial_lr)
@@ -316,7 +317,7 @@ def main():
             }
         )
 
-        torch.save(copy.deepcopy(pose_vae).cpu(), pose_vae_path)
+        save_model(pose_vae, pose_vae_path)
 
 
 if __name__ == "__main__":

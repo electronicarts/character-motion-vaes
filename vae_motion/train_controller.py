@@ -1,4 +1,3 @@
-import copy
 import os
 import time
 from types import SimpleNamespace
@@ -15,7 +14,12 @@ from algorithms.ppo import PPO
 from algorithms.storage import RolloutStorage
 from common.logging_utils import CSVLogger
 from common.misc_utils import update_linear_schedule, update_exponential_schedule
-from vae_motion.models import PoseVAEController, PoseVAEPolicy
+from vae_motion.models import (
+    PoseVAEController,
+    PoseVAEPolicy,
+    load_model,
+    save_model,
+)
 
 
 def make_gym_environment(args):
@@ -100,7 +104,7 @@ def main():
     args.observation_size = env.observation_space.shape[0]
 
     # other configs
-    args.save_path = os.path.join(current_dir, "con_" + args.env_name + ".pt")
+    args.save_path = os.path.join(current_dir, "con_" + args.env_name + ".safetensors")
 
     # sampling parameters
     args.num_frames = 10e7
@@ -136,14 +140,13 @@ def main():
     obs_shape = (obs_shape[0], *obs_shape[1:])
 
     if args.load_saved_model:
-        actor_critic = torch.load(args.save_path, map_location=args.device)
+        actor_critic = load_model(args.save_path, args.device)
         print("Loading model:", args.save_path)
     else:
         controller = PoseVAEController(args.observation_size, args.action_size)
         actor_critic = PoseVAEPolicy(controller)
 
     actor_critic = actor_critic.to(args.device)
-    actor_critic.env_info = {"frame_skip": args.frame_skip}
 
     agent = PPO(
         actor_critic,
@@ -221,7 +224,7 @@ def main():
 
         rollouts.after_update()
 
-        torch.save(copy.deepcopy(actor_critic).cpu(), args.save_path)
+        save_model(actor_critic, args.save_path, {"frame_skip": args.frame_skip})
 
         ep_info["reward"] = torch.cat(ep_info["reward"])
         logger.log_stats(
