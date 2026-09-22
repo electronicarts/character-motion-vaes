@@ -139,7 +139,7 @@ def main():
         actor_critic = torch.load(args.save_path, map_location=args.device)
         print("Loading model:", args.save_path)
     else:
-        controller = PoseVAEController(env)
+        controller = PoseVAEController(args.observation_size, args.action_size)
         actor_critic = PoseVAEPolicy(controller)
 
     actor_critic = actor_critic.to(args.device)

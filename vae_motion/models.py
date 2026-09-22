@@ -637,11 +637,11 @@ class PoseVQVAE(NormalizationMixin, nn.Module):
 
 
 class PoseVAEController(nn.Module):
-    def __init__(self, env):
+    def __init__(self, observation_dim, action_dim):
         super().__init__()
 
-        self.observation_dim = env.observation_space.shape[0]
-        self.action_dim = env.action_space.shape[0]
+        self.observation_dim = observation_dim
+        self.action_dim = action_dim
 
         init_r_ = lambda m: init(
             m,
@@ -673,6 +673,17 @@ class PoseVAEController(nn.Module):
             init_t_(nn.Linear(h_size, self.action_dim)),
             nn.Tanh(),
         )
+
+    @property
+    def config(self):
+        return {
+            "observation_dim": self.observation_dim,
+            "action_dim": self.action_dim,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(config["observation_dim"], config["action_dim"])
 
     def forward(self, x):
         return self.actor(x)
@@ -708,6 +719,17 @@ class PoseVAEPolicy(nn.Module):
             init_s_(nn.Linear(h_size, 1)),
         )
         self.state_size = 1
+
+    @property
+    def config(self):
+        return {
+            "observation_dim": self.actor.observation_dim,
+            "action_dim": self.actor.action_dim,
+        }
+
+    @classmethod
+    def from_config(cls, config, tensors):
+        return cls(PoseVAEController(config["observation_dim"], config["action_dim"]))
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -748,6 +770,8 @@ MODEL_REGISTRY = {
     "PoseMixtureVAE": PoseMixtureVAE,
     "PoseMixtureSpecialistVAE": PoseMixtureSpecialistVAE,
     "PoseVQVAE": PoseVQVAE,
+    "PoseVAEController": PoseVAEController,
+    "PoseVAEPolicy": PoseVAEPolicy,
 }
 
 
